@@ -426,14 +426,12 @@ def main() -> None:
             print(f"  {k:12}: {v:.4f}" if isinstance(v, float) else f"  {k:12}: {v}")
 
     # Salva plots
-    plot_confusion_matrix(final['cm'],   STATS_DIR / 'test_confusion_matrix.png', 'Test Set - Confusion Matrix')
-    plot_roc_curve(final['y_true'], final['probs'], STATS_DIR / 'test_roc_curve.png', 'Test Set - ROC Curve')
-    plot_training_curves(history,        STATS_DIR / 'training_curves.png')
+    plot_confusion_matrix(final['cm'],   STATS_DIR / 'test_confusion_matrix-CRNN.png', 'Test Set - Confusion Matrix')
+    plot_roc_curve(final['y_true'], final['probs'], STATS_DIR / 'test_roc_curve-CRNN.png', 'Test Set - ROC Curve')
+    plot_training_curves(history,        STATS_DIR / 'training_curves-CRNN.png')
 
-    # Salva CSV
-    scalar_keys = [k for k, v in final.items() if isinstance(v, (int, float))]
-    pd.DataFrame([{k: final[k] for k in scalar_keys}]).to_csv(STATS_DIR / 'test_metrics.csv', index=False)
-    pd.DataFrame(history).to_csv(STATS_DIR / 'training_history.csv', index_label='epoch')
+   
+    
 
     # Salva checkpoint finale
     torch.save(
@@ -444,11 +442,9 @@ def main() -> None:
     )
 
     print(f"\nDone. Output salvati in milestone2/")
-    print(f"  → milestone2/stats/training_curves.png")
-    print(f"  → milestone2/stats/test_confusion_matrix.png")
-    print(f"  → milestone2/stats/test_roc_curve.png")
-    print(f"  → milestone2/stats/test_metrics.csv")
-    print(f"  → milestone2/stats/training_history.csv")
+    print(f"  → milestone2/stats/training_curves-CRNN.png")
+    print(f"  → milestone2/stats/test_confusion_matrix-CRNN.png")
+    print(f"  → milestone2/stats/test_roc_curve-CRNN.png")
     print(f"  → milestone2/checkpoints/best_model_final.pt")
 
 
