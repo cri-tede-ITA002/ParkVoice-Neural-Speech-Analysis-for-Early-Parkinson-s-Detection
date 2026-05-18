@@ -47,7 +47,7 @@ def generate_offline_augmentations(orig_paths: List[Path], output_dir: Path) -> 
     come file WAV in output_dir/ (già include la label, es. data/Training_augmented/HC)
     """
     for wav_path in orig_paths:
-        output_dir.mkdir(parents=True, exist_ok=True)  # FIX: niente doppio annidamento
+        output_dir.mkdir(parents=True, exist_ok=True)
         y, _ = librosa.load(wav_path, sr=SAMPLE_RATE)
         # 1) speed perturb
         for rate, suffix in zip(SPEED_RATES, ["speed_down", "speed_up"]):
