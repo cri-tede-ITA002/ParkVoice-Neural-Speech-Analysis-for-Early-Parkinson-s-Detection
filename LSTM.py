@@ -41,7 +41,7 @@ TEST_ROOT        = Path("data/Test")
 TRAIN_CACHE_DIR  = Path("artifacts/mel_specs_train")
 TEST_CACHE_DIR   = Path("artifacts/mel_specs_test")
 PLOT_DIR         = Path("artifacts/plots")
-CHECKPOINT_DIR   = Path("artifacts/checkpoints")
+CHECKPOINT_DIR   = Path("checkpoints/checkpoint_lstm")
 STATS_DIR        = Path("artifacts/stats")
 
 SAMPLE_RATE = 16_000  # 16 kHz
@@ -349,13 +349,208 @@ def step_epoch(model, loader, criterion, optimizer=None, device="cpu"):
     return running_loss / total, correct / total
 
 
+# ---------- Bootstrap (speaker-level) ----------
+
+def bootstrap_evaluate_speaker(
+    y_true: np.ndarray,
+    avg_probs: np.ndarray,
+    n_iterations: int = 1000,
+    ci: float = 0.95,
+    seed: int = RANDOM_SEED,
+) -> dict:
+    """
+    Bootstrap sul test set a livello di SOGGETTO.
+    Campiona con rimpiazzo tra i soggetti (non le finestre) e calcola
+    mean, std e CI per acc, precision, recall, f1 e roc_auc.
+    """
+    rng = np.random.default_rng(seed)
+    n   = len(y_true)
+
+    metrics_boot: dict[str, list] = {
+        "acc": [], "precision": [], "recall": [], "f1": [], "roc_auc": []
+    }
+
+    for _ in range(n_iterations):
+        idx   = rng.integers(0, n, size=n)
+        yt    = y_true[idx]
+        yp    = avg_probs[idx]
+        ypred = (yp > 0.5).astype(int)
+
+        metrics_boot["acc"].append(accuracy_score(yt, ypred))
+        p, r, f, _ = precision_recall_fscore_support(
+            yt, ypred, average="binary", zero_division=0
+        )
+        metrics_boot["precision"].append(p)
+        metrics_boot["recall"].append(r)
+        metrics_boot["f1"].append(f)
+        try:
+            metrics_boot["roc_auc"].append(roc_auc_score(yt, yp))
+        except ValueError:   # campione con una sola classe
+            pass
+
+    alpha   = 1.0 - ci
+    results = {}
+    for name, values in metrics_boot.items():
+        arr = np.array(values)
+        results[name] = {
+            "mean":  float(np.mean(arr)),
+            "std":   float(np.std(arr)),
+            "lower": float(np.percentile(arr, 100 * alpha / 2)),
+            "upper": float(np.percentile(arr, 100 * (1 - alpha / 2))),
+        }
+    return results
+
+
+def print_bootstrap_results(boot: dict, ci: float = 0.95, n_iterations: int = 1000) -> None:
+    ci_pct = int(ci * 100)
+    print(f"\n{'='*55}")
+    print(f"BOOTSTRAP ({n_iterations} iterazioni, CI {ci_pct}%  — speaker-level)")
+    print(f"{'='*55}")
+    print(f"  {'Metric':<12}  {'Mean':>7}  {'Std':>7}  {'CI lower':>9}  {'CI upper':>9}")
+    print(f"  {'-'*56}")
+    for name, vals in boot.items():
+        print(
+            f"  {name:<12}  {vals['mean']:>7.4f}  {vals['std']:>7.4f}"
+            f"  {vals['lower']:>9.4f}  {vals['upper']:>9.4f}"
+        )
+
+
+# ---------- Bootstrap standalone ----------
+
+EXPECTED_WIN_SHAPE = (WIN_FRAMES, N_MELS)   # (200, 64)
+
+
+def validate_and_fix_windows(cache_dir: Path) -> None:
+    """Elimina le finestre .npy con shape errata così vengono rigenerate."""
+    stale = []
+    for npy in cache_dir.glob("*.npy"):
+        try:
+            arr = np.load(str(npy), mmap_mode="r")
+            if arr.shape != EXPECTED_WIN_SHAPE:
+                stale.append(npy)
+        except Exception:
+            stale.append(npy)
+    if stale:
+        print(f"  [FIX] {len(stale)} finestre con shape errata "
+              f"(attesa {EXPECTED_WIN_SHAPE}) — eliminate per re-caching.")
+        for p in stale:
+            p.unlink()
+
+
+def _find_checkpoint() -> Path:
+    ckpt = CHECKPOINT_DIR / "best_model.pt"
+    if ckpt.exists():
+        return ckpt
+    raise FileNotFoundError(
+        f"Checkpoint non trovato: {ckpt}\n"
+        "Esegui prima python LSTM.py per addestrare il modello."
+    )
+
+
+def run_bootstrap_only(
+    checkpoint: str | None = None,
+    n_boot: int = 1000,
+    ci: float = 0.95,
+    seed: int = RANDOM_SEED,
+) -> None:
+    """
+    Carica il checkpoint salvato ed esegue solo inferenza + bootstrap
+    sul test set a livello di soggetto, senza riaddestrare.
+    """
+    print(f"\n{'='*55}")
+    print("MODALITÀ BOOTSTRAP-ONLY  (speaker-level)")
+    print(f"{'='*55}\n")
+
+    # 1. Checkpoint
+    ckpt_path = Path(checkpoint) if checkpoint else _find_checkpoint()
+    print(f"Checkpoint : {ckpt_path}")
+
+    # 2. Modello
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device     : {device}")
+    ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model = LSTMAudioClassifier().to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    # 3. Valida windows ed eventuale re-caching
+    print(f"\nValidazione windows in {TEST_CACHE_DIR} ...")
+    validate_and_fix_windows(TEST_CACHE_DIR)
+    test_files = sorted(TEST_CACHE_DIR.glob("*.npy"))
+    if not test_files:
+        print("Finestre non trovate — eseguo caching del test set ...")
+        cache_all_windows(TEST_ROOT, TEST_CACHE_DIR, plot=False)
+        test_files = sorted(TEST_CACHE_DIR.glob("*.npy"))
+    if not test_files:
+        raise RuntimeError(
+            f"Nessuna finestra generata in {TEST_CACHE_DIR}.\n"
+            f"Controlla che esistano .wav in {TEST_ROOT}/HC e {TEST_ROOT}/PD."
+        )
+
+    test_stems = {f.stem.rsplit("_win", 1)[0] for f in test_files}
+    print(f"Soggetti test : {len(test_stems)}  |  Finestre test : {len(test_files)}")
+
+    # 4. Inferenza speaker-level
+    print("\nInferenza sul test set (speaker-level) ...")
+    test_sp = evaluate_speaker_level(model, test_files, device)
+    cm = test_sp["cm"]
+    tn, fp, fn, tp = cm.ravel()
+
+    print(f"\n  Accuracy   : {test_sp['acc']:.4f}")
+    print(f"  Precision  : {test_sp['precision']:.4f}")
+    print(f"  Recall     : {test_sp['recall']:.4f}")
+    print(f"  F1         : {test_sp['f1']:.4f}")
+    print(f"  ROC-AUC    : {test_sp['roc_auc']:.4f}")
+    print(f"  TP={tp}  FP={fp}  TN={tn}  FN={fn}")
+
+    # 5. Bootstrap
+    print(f"\nEseguo bootstrap ({n_boot} iterazioni, CI {int(ci*100)}%) ...")
+    boot = bootstrap_evaluate_speaker(
+        test_sp["y_true"], test_sp["probs"],
+        n_iterations=n_boot, ci=ci, seed=seed
+    )
+    print_bootstrap_results(boot, ci=ci, n_iterations=n_boot)
+
+    # 6. Salva
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = STATS_DIR / "bootstrap_results_lstm.npz"
+    np.savez(
+        out_path,
+        y_true=test_sp["y_true"],
+        y_prob=test_sp["probs"],
+        **{f"boot_{k}_{stat}": v
+           for k, vals in boot.items()
+           for stat, v in vals.items()}
+    )
+    print(f"\nRisultati salvati in: {out_path}")
+
+
 # ---------- Main ----------
 def main():
     argp = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     argp.add_argument("-e", "--epochs", type=int, default=30, help="Number of epochs")
     argp.add_argument("--plot", action="store_true", help="Save one spectrogram per speaker")
     argp.add_argument("--recache", action="store_true", help="Force re-compute windows")
+    argp.add_argument(
+        "--bootstrap-only", action="store_true",
+        help="Salta il training: carica il checkpoint e riesegue solo bootstrap sul test set"
+    )
+    argp.add_argument("--checkpoint", type=str, default=None,
+                      help="Percorso checkpoint (usato con --bootstrap-only)")
+    argp.add_argument("--n-boot", type=int, default=1000,
+                      help="Iterazioni bootstrap (default 1000)")
+    argp.add_argument("--ci", type=float, default=0.95,
+                      help="Livello CI bootstrap (default 0.95)")
     args = argp.parse_args()
+
+    # ── modalità bootstrap-only ───────────────────────────────────────────
+    if args.bootstrap_only:
+        run_bootstrap_only(
+            checkpoint=args.checkpoint,
+            n_boot=args.n_boot,
+            ci=args.ci,
+        )
+        return
 
     print("EXECUTION TIME:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -476,6 +671,13 @@ def main():
     print(f"              Pred HC   Pred PD")
     print(f"  True HC  :    {tn:4d}      {fp:4d}")
     print(f"  True PD  :    {fn:4d}      {tp:4d}")
+
+    # Bootstrap speaker-level
+    boot = bootstrap_evaluate_speaker(
+        test_sp["y_true"], test_sp["probs"],
+        n_iterations=1000, ci=0.95
+    )
+    print_bootstrap_results(boot, ci=0.95, n_iterations=1000)
 
     # Salva plots speaker-level
     plot_confusion_matrix(
